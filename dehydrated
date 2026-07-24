@@ -1159,6 +1159,7 @@ get_last_cn() {
 # Create certificate for domain(s) and outputs it FD 3
 sign_csr() {
   csrfile="${1}" # path to CSR file
+  replaces_cert_identifier="${2}" # optional cert identifier as per rfc9773 section 4.1
 
   if { true >&3; } 2>/dev/null; then
     : # fd 3 looks OK
@@ -1166,7 +1167,7 @@ sign_csr() {
     _exiterr "sign_csr: FD 3 not open"
   fi
 
-  shift 1 || true
+  shift 2 || true
   export altnames="${*}"
 
   if [[ ${API} -eq 1 ]]; then
@@ -1204,6 +1205,9 @@ sign_csr() {
     local order_payload='{"identifiers": '"${challenge_identifiers}"
     if [[ -n "${ACME_PROFILE}" ]]; then
       order_payload="${order_payload}"',"profile":"'"${ACME_PROFILE}"'"'
+    fi
+    if [[ -n "${replaces_cert_identifier}" ]]; then
+      order_payload="${order_payload}"',"replaces":"'"${replaces_cert_identifier}"'"'
     fi
     order_payload="${order_payload}"'}'
     order_location="$(signed_request "${CA_NEW_ORDER}" "${order_payload}" 4>&1 | grep -i ^Location: | cut -d':' -f2- | tr -d ' \t\r\n')"
@@ -1567,6 +1571,8 @@ generate_alpn_certificate() {
 sign_domain() {
   local certdir="${1}"
   shift
+  local replaces_cert_identifier="${1}"
+  shift
   timestamp="${1}"
   shift
   domain="${1}"
@@ -1653,7 +1659,7 @@ sign_domain() {
 
   crt_path="${certdir}/cert-${timestamp}.pem"
   # shellcheck disable=SC2086
-  sign_csr "${certdir}/cert-${timestamp}.csr" ${altnames} 3>"${crt_path}"
+  sign_csr "${certdir}/cert-${timestamp}.csr" "${replaces_cert_identifier}" ${altnames} 3>"${crt_path}"
 
   # Create fullchain.pem
   echo " + Creating fullchain.pem..."
@@ -2011,14 +2017,18 @@ command_sign_domains() {
       fi
     fi
 
-    if [[ -e "${cert}" && "${force_renew}" = "no" && -n "${CA_RENEWAL_INFO}" ]]; then
-      printf " + Checking renewal info for existing cert..."
-
+    local cert_identifier=""
+    if [[ -e "${cert}" && -n "${CA_RENEWAL_INFO}" ]]; then
       authkeyid="$("${OPENSSL}" x509 -in "${cert}" -noout -ext authorityKeyIdentifier | sed -n '2{s/keyid://;s/[[:space:]:]//g;p}' | hex2bin | urlbase64)"
       serial="$("${OPENSSL}" x509 -in "${cert}" -noout -serial | cut -d= -f2)"
       encserial="$("${OPENSSL}" asn1parse -genstr "INT:0x${serial}" -noout -out - | tail -c +3 | urlbase64)"
+      cert_identifier="${authkeyid}.${encserial}"
+    fi
 
-      ari_response="$(http_request get "${CA_RENEWAL_INFO}/${authkeyid}.${encserial}" | jsonsh)"
+    if [[ -e "${cert}" && "${force_renew}" = "no" && -n "${CA_RENEWAL_INFO}" ]]; then
+      printf " + Checking renewal info for existing cert..."
+
+      ari_response="$(http_request get "${CA_RENEWAL_INFO}/${cert_identifier}" | jsonsh)"
       window_start="$(printf "%s" "${ari_response}" | get_json_string_value -p '"suggestedWindow","start"')"
       window_end="$(printf "%s" "${ari_response}" | get_json_string_value -p '"suggestedWindow","end"')"
       expl_url="$(printf "%s" "${ari_response}" | get_json_string_value explanationURL)"
@@ -2081,11 +2091,11 @@ command_sign_domains() {
       # shellcheck disable=SC2086
       if [[ "${KEEP_GOING:-}" = "yes" ]]; then
         skip_exit_hook=yes
-        sign_domain "${certdir}" "${timestamp}" "${domain}" ${morenames} &
+        sign_domain "${certdir}" "${cert_identifier}" "${timestamp}" "${domain}" ${morenames} &
         wait $! || exit_with_errorcode=1
         skip_exit_hook=no
       else
-        sign_domain "${certdir}" "${timestamp}" "${domain}" ${morenames}
+        sign_domain "${certdir}" "${cert_identifier}" "${timestamp}" "${domain}" ${morenames}
       fi
     fi
 
@@ -2135,7 +2145,7 @@ command_sign_csr() {
   # gen cert
   certfile="$(_mktemp)"
   # shellcheck disable=SC2086
-  sign_csr "${csrfile}" ${altnames} 3> "${certfile}"
+  sign_csr "${csrfile}" "" ${altnames} 3> "${certfile}"
 
   # print cert
   echo "# CERT #" >&3
